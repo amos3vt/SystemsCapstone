@@ -1,14 +1,10 @@
 #include <stdio.h>
-#include "crmalloc.h"
+#include "crmm.h"
 #include "nvstore.h"
 
-/* Instance getter for memory manager */
-static struct memory_manager *mm_instance() {
-    static struct nvmetadata *meta;
+// EACH THREAD NEEDS TO KEEP TRACK OF WHICH ARENA IT OWNS
 
-    meta = nvmetadata_instance();
-    return &meta->mm;
-}
+// TODO: Add param to malloc that tells it to SPECIFICALLY allocate new pages
 
 /* Given tag, determine size of payload it guards */
 static inline size_t tag_payload_size(union boundary_tag *tag) {
@@ -18,6 +14,13 @@ static inline size_t tag_payload_size(union boundary_tag *tag) {
 /* Determine if tag refers to a block that is in use */
 static inline bool tag_inuse(union boundary_tag *tag) {
     return tag->data.inuse;
+}
+
+/* From a pointer to a payload, get the block */
+static inline struct block *payload_to_block(void *payload) {
+    return (struct block *) (
+        ((void*) payload) - offsetof(struct block, payload)
+    );
 }
 
 /* Determine payload size of block */
@@ -30,22 +33,15 @@ static inline bool block_inuse(struct block *b) {
     return tag_inuse(&b->tag);
 }
 
-/* From a pointer to a payload, get the block */
-static inline struct block *payload_to_block(void *payload) {
-    return (struct block*) (
-        ((void *) payload) - offsetof(struct block, payload)
-    );
-}
-
 /* Getter for left tag of block */
-static inline union boundary_tag *block_left_tag(struct block *b) {
+static inline union boundary_tag *block_tag_left(struct block *b) {
     return &b->tag;
 }
 
-/* Getter for right tag in block */
-static inline union boundary_tag *block_right_tag(struct block *b) {
+/* Getter for right tag of block */
+static inline union boundary_tag *block_tag_right(struct block *b) {
     return (union boundary_tag *) (
-        ((void *) b) + sizeof(struct block) + block_payload_size(b)
+        ((void*) b) + sizeof(struct block) + block_payload_size(b)
     );
 }
 
@@ -59,7 +55,7 @@ static inline struct block *block_on_left(struct block *block) {
     // Guard if current block is leftmost in the set of pages
     if (b <= block->mem_lo) { return NULL; }
 
-    // Determine payload size and back up the pointer
+    // Determine payload size and back up pointer to start of payload
     size_t payload_size = tag_payload_size((union boundary_tag *) b);
     void *payload = b - payload_size;
 
@@ -70,17 +66,17 @@ static inline struct block *block_on_left(struct block *block) {
 /* Given a block, find the block on its right */
 static inline struct block *block_on_right(struct block *block) {
     void *b = (void *) block;
-    b += block_payload_size(block) 
-         + sizeof(struct block) 
+    b += block_payload_size(block)
+         + sizeof(struct block)
          + sizeof(union boundary_tag);
-    return b > ((void *) block->mem_hi) ? NULL : (struct block *) b;
+    return b > ((void*) block->mem_hi) ? NULL : (struct block *) b;
 }
 
-/**
- * Attempt to split block. Assumes given block is large enough to store
- * at least the requested_size
+/* 
+ * Attempt to split block. Assumes the given block is large enough to 
+ * store at least the requested size.
  */
-static struct block *split_block(struct block *b, size_t requested_size) {
+static struct block *split_block(struct arena *a, struct block *b, size_t requested_size) {    
 
     // Only split if the remainder is large enough to hold a payload
     int64_t remainder_size = (int64_t) block_payload_size(b)
@@ -89,36 +85,48 @@ static struct block *split_block(struct block *b, size_t requested_size) {
     if (remainder_size > 0) {
 
         // Shrink payload size of current block
-        block_left_tag(b)->data.payload_size = requested_size;
-        block_right_tag(b)->data.payload_size = requested_size;
+        block_tag_left(b)->data.payload_size = requested_size;
+        block_tag_right(b)->data.payload_size = requested_size;
 
         // Set boundary tags of next block
-        struct block *next_b = ((void *) block_right_tag(b))
+        struct block *next_b = ((void *) block_tag_right(b))
                                + sizeof(union boundary_tag);
-        block_left_tag(next_b)->data.payload_size = (size_t) remainder_size;
-        block_left_tag(next_b)->data.inuse = false;
-        block_right_tag(next_b)->data.payload_size = (size_t) remainder_size;
-        block_right_tag(next_b)->data.inuse = false;
+        block_tag_left(next_b)->data.payload_size = (size_t) remainder_size;
+        block_tag_left(next_b)->data.inuse = false;
+        block_tag_right(next_b)->data.payload_size = (size_t) remainder_size;
+        block_tag_right(next_b)->data.inuse = false;
 
         // Set absolute memory boundaries of next block
         next_b->mem_lo = b->mem_lo;
         next_b->mem_hi = b->mem_hi;
 
         // Add next block to free list
-        struct memory_manager *mm = mm_instance();
-        list_push_back(&mm->free, &next_b->elem);
-
+        list_push_back(&a->free, &next_b->elem);
     }
 
     // Mark current block as inuse
-    block_left_tag(b)->data.inuse = true;
-    block_right_tag(b)->data.inuse = true;
+    block_tag_left(b)->data.inuse = true;
+    block_tag_right(b)->data.inuse = true;
 
     return b;
 }
 
+/* Search for free block with large enough payload */
+static struct block *find_reusable_block(struct arena *a, size_t size) {
+    struct list_elem *e = list_begin(&a->free);
+    while (e != list_end(&a->free)) {
+        struct block *b = list_entry(e, struct block, elem);
+        if (block_payload_size(b) >= size) {
+            list_remove(e);
+            return split_block(a, b, size);
+        }
+        e = list_next(e);
+    }
+    return NULL;
+}
+
 /* Allocate pages of memory to satisfy request size */
-static struct block *make_block(size_t payload_size) {
+static struct block *make_block(struct arena *a, size_t payload_size) {
 
     // Determine number of pages to request
     size_t block_size = payload_size + METADATA_SIZE;
@@ -132,41 +140,26 @@ static struct block *make_block(size_t payload_size) {
     }
 
     // Initialize boundary tags
-    block_left_tag(b)->data.payload_size = npages*PAGESIZE-METADATA_SIZE;
-    block_left_tag(b)->data.inuse = true;
-    block_right_tag(b)->data.payload_size = npages*PAGESIZE-METADATA_SIZE;
-    block_right_tag(b)->data.inuse = true;
+    block_tag_left(b)->data.payload_size = npages*PAGESIZE-METADATA_SIZE;
+    block_tag_left(b)->data.inuse = true;
+    block_tag_right(b)->data.payload_size = npages*PAGESIZE-METADATA_SIZE;
+    block_tag_right(b)->data.inuse = true;
 
     // Initialize absolute memory boundaries
     b->mem_lo = (void *) b;
     b->mem_hi = ((void *) b) + npages*PAGESIZE;
 
     // Split block to free any unused spaces
-    return split_block(b, block_size);
+    return split_block(a, b, block_size);
 
 }
 
-/* Search for free block with large enough payload */
-static struct block *find_reusable_block(size_t size) {
-    struct memory_manager *mm = mm_instance();
-    struct list_elem *e = list_begin(&mm->free);
-    while (e != list_end(&mm->free)) {
-        struct block *b = list_entry(e, struct block, elem);
-        if (block_payload_size(b) >= size) {
-            list_remove(e);
-            return split_block(b, size);
-        }
-        e = list_next(e);
-    }
-    return NULL;
-}
-
-/* Attempt to coalesce block with its neighbors */
+/* Attempt to coalese block with its neighbors */
 static struct block *coalesce(struct block *b) {
 
     // Mark block as free
-    block_left_tag(b)->data.inuse = false;
-    block_right_tag(b)->data.inuse = false;
+    block_tag_left(b)->data.inuse = false;
+    block_tag_right(b)->data.inuse = false;
 
     // Get neighboring blocks
     struct block *left_b = block_on_left(b);
@@ -182,11 +175,11 @@ static struct block *coalesce(struct block *b) {
                           + METADATA_SIZE;
         
         // Update right tag
-        block_right_tag(right_b)->data.payload_size = new_size;
-        block_right_tag(right_b)->data.inuse = false;
+        block_tag_right(right_b)->data.payload_size = new_size;
+        block_tag_right(right_b)->data.inuse = false;
 
         // Update left tag
-        block_left_tag(b)->data.payload_size = new_size;
+        block_tag_left(b)->data.payload_size = new_size;
 
     }
 
@@ -200,12 +193,12 @@ static struct block *coalesce(struct block *b) {
                           + METADATA_SIZE;
 
         // Update left tag
-        block_left_tag(left_b)->data.payload_size = new_size;
-        block_left_tag(left_b)->data.inuse = false;
+        block_tag_left(left_b)->data.payload_size = new_size;
+        block_tag_left(left_b)->data.inuse = false;
 
         // Update right tag
-        block_right_tag(b)->data.payload_size = new_size;
-        block_right_tag(b)->data.inuse = false;
+        block_tag_right(b)->data.payload_size = new_size;
+        block_tag_right(b)->data.inuse = false;
 
         // Start of block is now where left block started
         b = left_b;
@@ -215,36 +208,47 @@ static struct block *coalesce(struct block *b) {
     return b;
 }
 
-/* ---------- USER INTERFACE ---------- */
-void mm_init(struct memory_manager *mm)
-{
-    list_init(&mm->free);
+/* -------------------- User Interface -------------------- */
+
+static struct arena *crmm_arena_init() {
+
+    // Get nvmetadata
+    static struct nvmetadata *meta;
+    meta = nvmetadata_instance();
+
+    // Allocate new arena
+    struct arena *a = malloc(1*sizeof(struct arena));
+    list_init(&a->free);
+
+    // Add arena to nvmetadata
+    list_push_back(&meta->arenalist, &a->elem);
+
+    // Return pointer to arena
+    return a;
+
 }
 
-/* Return a usable block with given minimum size */
-void *crmalloc(size_t size) {
-
+/* Return a usable block with the given minimum size */
+void *crmm_arena_malloc(size_t size, struct arena *a) {
+    
     // Ignore spurious requests
     if (size == 0) { return NULL; }
 
     // Search reusable free blocks
-    struct block *b = find_reusable_block(size);
+    struct block *b = find_reusable_block(a, size);
     if (b) { return b->payload; }
 
     // No suitable free blocks available; allocate new block
-    b = make_block(size);
+    b = make_block(a, size);
     return b->payload;
 
 }
 
-/* Free a block for reuse, coalesce when possible */
-void crfree(void *ptr) {
+/* Free a block for reuse, coalescing where possible */
+void crmm_arena_free(void *ptr, struct arena *a) {
 
     // Ignore spurious requests
     if (ptr == NULL) { return; }
-
-    // Instance getter
-    struct memory_manager *mm = mm_instance();
 
     // Get block from payload
     struct block *b = payload_to_block(ptr);
@@ -253,16 +257,17 @@ void crfree(void *ptr) {
     b = coalesce(b);
 
     // Add to free list
-    list_push_back(&mm->free, &b->elem);
+    list_push_back(&a->free, &b->elem);
 
 }
 
-void *crrealloc(void *ptr, size_t size) {
-
+/* Reshape block */
+void *crmm_arena_realloc(void *ptr, size_t size, struct arena *a) {
+    
     // Reduce spurious requests
-    if (ptr == NULL) { return crmalloc(size); }
+    if (ptr == NULL) { return crmm_arena_malloc(size, a); }
     if (size == 0) {
-        crfree(ptr);
+        crmm_arena_free(ptr, a);
         return NULL;
     }
 
@@ -272,7 +277,7 @@ void *crrealloc(void *ptr, size_t size) {
 
     // If new block is smaller than old block, split
     if (size <= block_payload_size(old_b)) {
-        struct block *b = split_block(old_b, size);
+        struct block *b = split_block(a, old_b, size);
         return b->payload;
     }
 
@@ -288,22 +293,31 @@ void *crrealloc(void *ptr, size_t size) {
             list_remove(&right_b->elem);
 
             // Update right boundary tag
-            block_right_tag(right_b)->data.payload_size = combined_size;
-            block_right_tag(right_b)->data.inuse = true;
+            block_tag_right(right_b)->data.payload_size = combined_size;
+            block_tag_right(right_b)->data.inuse = true;
 
             // Update left boundary tag
-            block_left_tag(old_b)->data.payload_size = combined_size;
-            block_left_tag(old_b)->data.inuse = true;
+            block_tag_left(old_b)->data.payload_size = combined_size;
+            block_tag_left(old_b)->data.inuse = true;
 
             return old_b->payload;
         }
     }
 
     // Otherwise, malloc a new block, copy memory, free old block
-    char *new_payload = crmalloc(size);
+    char *new_payload = crmm_arena_malloc(size, a);
     for (size_t i = 0; i < block_payload_size(old_b); i++) {
         new_payload[i] = old_payload[i];
     }
-    crfree(old_payload);
+    crmm_arena_free(old_payload, a);
     return new_payload;
+
+}
+
+void crmm_arena_shutdown(struct arena *a) {
+
+    // Remove arena from arena list
+    list_remove(&a->elem);
+
+    
 }

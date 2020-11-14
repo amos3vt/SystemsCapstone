@@ -46,7 +46,8 @@ struct nvmetadata
 
     enum nvexecstate execstate;     /* "how far did you get last time"        */
     
-    struct memory_manager mm;       /* memory manager container               */
+    //struct memory_manager mm;       /* memory manager container               */
+    struct list arenalist           /* list of memory arenas */
 
     pthread_mutex_t threadlock;     /* lock for thread handles container      */
     struct list threadlist;         /* list of thread handles                 */

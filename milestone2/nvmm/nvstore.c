@@ -418,7 +418,8 @@ static void nvstore_initmeta()
 
         /* upon first init, we initialize the lists and the writelock as well */
         nvmetadata_unlock(self->meta);
-        mm_init(&self->meta->mm);
+        //mm_init(&self->meta->mm);
+        list_init(&self->meta->arenalist);
         list_init(&self->meta->threadlist);
         list_init(&self->meta->mutexlist);
     }
